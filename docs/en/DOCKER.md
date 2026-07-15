@@ -37,6 +37,18 @@ services:
       start_period: 60s
 ```
 
+Web Setup writes the database configuration directly to `/app/db/.env` in the container, which is `./db/.env` on the host. No additional single-file mount is needed, and the configuration survives container recreation and upgrades. If only the legacy `/app/.env` exists at startup, the application attempts to copy it to `/app/db/.env` before loading it.
+
+If an existing container has already completed Web Setup, export its configuration before the first upgrade to the new version. Once that container is removed, the legacy `/app/.env` in its writable layer cannot be recovered automatically:
+
+```bash
+mkdir -p db
+docker cp nodepassdash:/app/.env ./db/.env
+chmod 600 db/.env
+docker compose pull
+docker compose up -d --force-recreate
+```
+
 3) Start:
 
 ```bash

@@ -52,7 +52,7 @@ func SetupRouter(db *gorm.DB, sseService *sse.Service, sseManager *sse.Manager, 
 	setupAlreadyCompleted := func(c *gin.Context) {
 		c.JSON(http.StatusForbidden, gin.H{
 			"error":       "setup_already_completed",
-			"description": "数据库已初始化,Setup 向导不再可用。要重新初始化,请删除项目根目录 .env 后重启服务。",
+			"description": "数据库已初始化,Setup 向导不再可用。要重新初始化,请删除 db/.env（以及旧版项目根目录 .env）后重启服务。",
 		})
 	}
 	r.POST("/api/setup/test-connection", setupAlreadyCompleted)

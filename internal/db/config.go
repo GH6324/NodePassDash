@@ -14,15 +14,66 @@ import (
 	"time"
 )
 
-// EnvFileName 是 Web 向导落盘 / godotenv 加载的目标文件,放在项目根目录。
-// 与 docker-compose 的惯例一致:容器内的 env 注入与裸跑的文件加载使用同一个 KV schema。
-const EnvFileName = ".env"
+const (
+	// EnvFileName 是 Web 向导落盘 / godotenv 加载的首选目标文件。
+	// Docker Compose 已持久化整个 db 目录,因此该文件会随数据库一起保留。
+	EnvFileName = "db/.env"
+
+	// LegacyEnvFileName 是旧版本使用的项目根目录配置路径。
+	LegacyEnvFileName = ".env"
+)
+
+// ResolveEnvFile 返回本次启动应加载的 env 文件。
+// 首选文件不存在时,会把旧版根目录 .env 复制到 db/.env;复制失败则回退读取旧文件。
+func ResolveEnvFile() (path string, migrated bool, err error) {
+	return resolveEnvFile(EnvFileName, LegacyEnvFileName)
+}
+
+func resolveEnvFile(preferredPath, legacyPath string) (path string, migrated bool, err error) {
+	info, preferredErr := os.Stat(preferredPath)
+	if preferredErr == nil && info.Mode().IsRegular() {
+		file, openErr := os.Open(preferredPath)
+		if openErr == nil {
+			_ = file.Close()
+			return preferredPath, false, nil
+		}
+		preferredErr = openErr
+	}
+	if preferredErr == nil {
+		preferredErr = fmt.Errorf("不是普通文件")
+	}
+
+	// 首选路径存在但不可读取时,仍尽量回退到旧文件保证服务可启动。
+	if !os.IsNotExist(preferredErr) {
+		if legacyInfo, legacyErr := os.Stat(legacyPath); legacyErr == nil && legacyInfo.Mode().IsRegular() {
+			return legacyPath, false, fmt.Errorf("首选 env 文件 %s 不可用,回退到 %s: %v", preferredPath, legacyPath, preferredErr)
+		}
+		return preferredPath, false, fmt.Errorf("首选 env 文件 %s 不可用: %v", preferredPath, preferredErr)
+	}
+
+	legacyData, legacyErr := os.ReadFile(legacyPath)
+	if os.IsNotExist(legacyErr) {
+		return preferredPath, false, nil
+	}
+	if legacyErr != nil {
+		return legacyPath, false, fmt.Errorf("读取旧版 env 文件 %s 失败: %v", legacyPath, legacyErr)
+	}
+
+	if dir := filepath.Dir(preferredPath); dir != "." && dir != "" {
+		if mkdirErr := os.MkdirAll(dir, 0o755); mkdirErr != nil {
+			return legacyPath, false, fmt.Errorf("迁移 env 文件到 %s 失败: %v", preferredPath, mkdirErr)
+		}
+	}
+	if writeErr := os.WriteFile(preferredPath, legacyData, 0o600); writeErr != nil {
+		return legacyPath, false, fmt.Errorf("迁移 env 文件到 %s 失败: %v", preferredPath, writeErr)
+	}
+	return preferredPath, true, nil
+}
 
 // DBConfig 是后端数据库配置的真值结构。
 // 来源优先级: 命令行 flag > 环境变量 (含 .env 文件提前注入的) > 默认值。
 //
-// 不存在"独立的配置文件路径"——Web 向导的产物是一份 .env,启动时由 godotenv 注入到 env,
-// 然后所有读取统一走环境变量。
+// Web 向导的产物是一份 db/.env,启动时由 godotenv 注入到 env,然后所有读取统一走环境变量。
 type DBConfig struct {
 	// Driver 取值: "sqlite" 或 "postgres"。空表示尚未配置(进入 Setup 模式)。
 	Driver string
@@ -52,7 +103,7 @@ type DBConfig struct {
 }
 
 // GetDBConfig 获取数据库配置,合并默认值 / 环境变量 / flag。
-// 调用前应确保 main.go 已经 godotenv.Load(".env"),否则 .env 的值不会生效。
+// 调用前应确保 main.go 已经加载 ResolveEnvFile 返回的文件,否则 .env 的值不会生效。
 func GetDBConfig(dbDir string) DBConfig {
 	config := defaultConfig(dbDir)
 

@@ -257,11 +257,11 @@ func testConnection(req setupRequest) error {
 //  2. 用提供的参数打开 DB + Ping
 //  3. AutoMigrate 建所有表
 //  4. 用 admin 凭据写第一个管理员 + 落 4 条合规留痕配置
-//  5. 把数据库参数合并写入项目根目录的 .env
+//  5. 把数据库参数合并写入 db/.env
 //
 // 前 4 步在 DB 端持久化,只有都成功才会落盘 .env。
 // .env 一旦落盘下次重启就会进 Ready 模式;若 .env 落盘失败,
-// 数据库里的表和管理员账号会保留,用户可手工创建 .env 后重启。
+// 数据库里的表和管理员账号会保留,用户可手工创建 db/.env 后重启。
 func runSetupInitialize(req setupRequest, clientIP, userAgent string) error {
 	if req.Admin.Username == "" || req.Admin.Password == "" {
 		return fmt.Errorf("管理员账号和密码不能为空")

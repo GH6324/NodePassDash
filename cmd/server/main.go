@@ -32,15 +32,22 @@ import (
 	"gorm.io/gorm"
 )
 
-// loadDotEnv 在启动最早期把项目根目录 .env 注入到环境变量。
+// loadDotEnv 在启动最早期把 db/.env 注入到环境变量,并兼容迁移旧版根目录 .env。
 // 不覆盖已经存在的真 env 变量(命令行 export 优先,与 docker-compose 习惯一致)。
 // 文件不存在时静默跳过——首次启动尚未跑 Setup 向导时就是这种情况。
 func loadDotEnv() {
-	if _, err := os.Stat(".env"); os.IsNotExist(err) {
+	envFile, migrated, resolveErr := dbPkg.ResolveEnvFile()
+	if resolveErr != nil {
+		log.Warnf("[启动]env 文件路径处理失败: %v", resolveErr)
+	}
+	if migrated {
+		log.Infof("[启动]已将旧版 %s 迁移到 %s", dbPkg.LegacyEnvFileName, dbPkg.EnvFileName)
+	}
+	if _, err := os.Stat(envFile); os.IsNotExist(err) {
 		return
 	}
-	if err := godotenv.Load(".env"); err != nil {
-		log.Warnf("[启动].env 文件加载失败,将仅使用 env / flag: %v", err)
+	if err := godotenv.Load(envFile); err != nil {
+		log.Warnf("[启动]%s 文件加载失败,将仅使用 env / flag: %v", envFile, err)
 	}
 }
 

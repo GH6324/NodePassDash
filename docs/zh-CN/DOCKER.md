@@ -37,6 +37,18 @@ services:
       start_period: 60s
 ```
 
+Web Setup 生成的数据库配置会直接保存为容器内的 `/app/db/.env`，对应宿主机的 `./db/.env`，因此无需新增单文件映射，重新创建或升级容器后也不会丢失。启动时如果只有旧版 `/app/.env`，程序会尝试将它复制到 `/app/db/.env` 后再加载。
+
+如果现有容器已经完成 Web Setup，请在第一次升级到新版本前导出容器内的配置；容器被删除后，其可写层中的旧 `/app/.env` 无法自动恢复：
+
+```bash
+mkdir -p db
+docker cp nodepassdash:/app/.env ./db/.env
+chmod 600 db/.env
+docker compose pull
+docker compose up -d --force-recreate
+```
+
 3）启动：
 
 ```bash
@@ -141,4 +153,3 @@ docker compose up -d
 - 健康检查：`curl -fsS http://localhost:3000/api/health`
 - 查看日志：`docker logs -f nodepassdash`
 - 重置管理员密码（重置后需要重启容器）：`docker exec -it nodepassdash ./nodepassdash --resetpwd`
-
