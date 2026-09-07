@@ -2,12 +2,15 @@ package dashboard
 
 import (
 	"fmt"
+	"os"
 	"testing"
 	"time"
 
 	"NodePassDash/internal/models"
 
 	"github.com/glebarez/sqlite"
+	"github.com/google/uuid"
+	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
 )
 
@@ -15,12 +18,36 @@ func newTrafficTestDB(t *testing.T) *gorm.DB {
 	t.Helper()
 
 	dsn := fmt.Sprintf("file:%s?mode=memory&cache=shared", t.Name())
-	db, err := gorm.Open(sqlite.Open(dsn), &gorm.Config{
+	var dialector gorm.Dialector = sqlite.Open(dsn)
+	// Set TEST_POSTGRES_DSN to run the same assertions against PostgreSQL.
+	if pgDSN := os.Getenv("TEST_POSTGRES_DSN"); pgDSN != "" {
+		admin, err := gorm.Open(postgres.Open(pgDSN), &gorm.Config{})
+		if err != nil {
+			t.Fatalf("open postgres: %v", err)
+		}
+		schema := "traffic_test_" + uuid.New().String()[:8]
+		if err := admin.Exec("CREATE SCHEMA " + schema).Error; err != nil {
+			t.Fatalf("create test schema: %v", err)
+		}
+		t.Cleanup(func() {
+			if err := admin.Exec("DROP SCHEMA " + schema + " CASCADE").Error; err != nil {
+				t.Errorf("drop test schema: %v", err)
+			}
+			sqlDB, _ := admin.DB()
+			sqlDB.Close()
+		})
+		dialector = postgres.Open(pgDSN + " search_path=" + schema)
+	}
+	db, err := gorm.Open(dialector, &gorm.Config{
 		DisableForeignKeyConstraintWhenMigrating: true,
 	})
 	if err != nil {
-		t.Fatalf("open sqlite: %v", err)
+		t.Fatalf("open traffic database: %v", err)
 	}
+	t.Cleanup(func() {
+		sqlDB, _ := db.DB()
+		sqlDB.Close()
+	})
 	if err := db.AutoMigrate(
 		&models.ServiceHistory{},
 		&models.TrafficHourlySummary{},
@@ -36,6 +63,121 @@ func newTrafficTestDB(t *testing.T) *gorm.DB {
 	}
 
 	return db
+}
+
+func TestTrafficTrendUsesUTCWindow(t *testing.T) {
+	db := newTrafficTestDB(t)
+	originalLocal := time.Local
+	time.Local = time.FixedZone("UTC+8", 8*60*60)
+	t.Cleanup(func() { time.Local = originalLocal })
+	hour := time.Now().UTC().Truncate(time.Hour)
+	rows := []models.DashboardTrafficSummary{
+		{HourTime: hour.Add(-23 * time.Hour), TCPRxTotal: 100, InstanceCount: 1},
+		{HourTime: hour, TCPRxTotal: 200, InstanceCount: 1},
+	}
+	if err := db.Create(&rows).Error; err != nil {
+		t.Fatal(err)
+	}
+	trend, err := NewService(db).GetTrafficTrend(24)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(trend) != 2 || trend[0].TCPRx != 100 || trend[1].TCPRx != 200 {
+		t.Fatalf("trend = %+v, want both UTC hours", trend)
+	}
+}
+
+func TestAggregateTrafficDataIncludesCurrentHour(t *testing.T) {
+	db := newTrafficTestDB(t)
+	hour := time.Now().UTC().Truncate(time.Hour)
+	history := []models.ServiceHistory{
+		{EndpointID: 1, InstanceID: "a", RecordTime: hour.Add(-time.Minute), DeltaTCPIn: 100},
+		{EndpointID: 1, InstanceID: "a", RecordTime: hour, DeltaTCPIn: 150},
+	}
+	if err := db.Create(&history).Error; err != nil {
+		t.Fatal(err)
+	}
+	service := NewTrafficService(db)
+	for i := 0; i < 2; i++ {
+		if err := service.AggregateTrafficData(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var current models.TrafficHourlySummary
+	if err := db.Where("hour_time = ?", hour).First(&current).Error; err != nil {
+		t.Fatal(err)
+	}
+	if current.TCPRxIncrement != 50 {
+		t.Fatalf("current hour increment = %d, want 50 after repeated refresh", current.TCPRxIncrement)
+	}
+}
+
+func TestHourlyIncrementsIncludeResetsAndDeduplicateSnapshots(t *testing.T) {
+	db := newTrafficTestDB(t)
+	hour := time.Date(2026, 9, 7, 5, 0, 0, 0, time.UTC)
+	if err := db.Create(&models.TrafficHourlySummary{
+		HourTime: hour.Add(-time.Hour), EndpointID: 1, InstanceID: "a", TCPRxTotal: 100,
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	history := []models.ServiceHistory{
+		{EndpointID: 1, InstanceID: "a", RecordTime: hour, DeltaTCPIn: 140},
+		{EndpointID: 1, InstanceID: "a", RecordTime: hour, DeltaTCPIn: 150},
+		{EndpointID: 1, InstanceID: "a", RecordTime: hour.Add(time.Minute), DeltaTCPIn: 20},
+		{EndpointID: 1, InstanceID: "a", RecordTime: hour.Add(2 * time.Minute), DeltaTCPIn: 80},
+		{EndpointID: 1, InstanceID: "a", RecordTime: hour.Add(3 * time.Minute), DeltaTCPIn: 10},
+		{EndpointID: 1, InstanceID: "a", RecordTime: hour.Add(4 * time.Minute), DeltaTCPIn: 120},
+		{EndpointID: 2, InstanceID: "a", RecordTime: hour, DeltaTCPIn: 1_000_000},
+		{EndpointID: 2, InstanceID: "a", RecordTime: hour, DeltaTCPIn: 2_000_000},
+		{EndpointID: 2, InstanceID: "a", RecordTime: hour.Add(time.Minute), DeltaTCPIn: 2_000_050},
+	}
+	if err := db.Create(&history).Error; err != nil {
+		t.Fatal(err)
+	}
+	service := NewTrafficService(db)
+	for i := 0; i < 2; i++ {
+		if err := service.AggregateTrafficDataForHour(hour); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var rows []models.TrafficHourlySummary
+	if err := db.Where("hour_time = ?", hour).Order("endpoint_id").Find(&rows).Error; err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 2 || rows[0].TCPRxIncrement != 250 || rows[1].TCPRxIncrement != 50 {
+		t.Fatalf("hourly rows = %+v, want increments 250 and 50", rows)
+	}
+}
+
+func TestCarryForwardReconcilesLateHistory(t *testing.T) {
+	db := newTrafficTestDB(t)
+	if err := db.Exec("CREATE TABLE tunnels (endpoint_id bigint, instance_id text)").Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Exec("INSERT INTO tunnels (endpoint_id, instance_id) VALUES (1, 'a')").Error; err != nil {
+		t.Fatal(err)
+	}
+	hour := time.Date(2026, 9, 7, 5, 0, 0, 0, time.UTC)
+	service := NewTrafficService(db)
+	for i, total := range []int64{100, 150} {
+		if err := db.Create(&models.ServiceHistory{
+			EndpointID: 1, InstanceID: "a", RecordTime: hour.Add(time.Duration(i) * time.Minute), DeltaTCPIn: total,
+		}).Error; err != nil {
+			t.Fatal(err)
+		}
+		for _, start := range []time.Time{hour, hour.Add(time.Hour)} {
+			if err := service.AggregateTrafficDataForHour(start); err != nil {
+				t.Fatal(err)
+			}
+		}
+		var current models.TrafficHourlySummary
+		if err := db.Where("hour_time = ?", hour.Add(time.Hour)).First(&current).Error; err != nil {
+			t.Fatal(err)
+		}
+		if current.TCPRxTotal != total || current.TCPRxIncrement != 0 {
+			t.Fatalf("carried total/increment = %d/%d, want %d/0", current.TCPRxTotal, current.TCPRxIncrement, total)
+		}
+	}
 }
 
 func TestAggregateTrafficDataForHourNormalizesUTCAndKeepsInt64(t *testing.T) {
@@ -153,12 +295,19 @@ func TestCleanInvalidDashboardTrafficKeepsRealZeroTrafficRows(t *testing.T) {
 
 func TestTodayAndWeeklyStatsUsePositiveHourlyIncrements(t *testing.T) {
 	db := newTrafficTestDB(t)
+	originalLocal := time.Local
+	time.Local = time.FixedZone("UTC+8", 8*60*60)
+	t.Cleanup(func() { time.Local = originalLocal })
 	now := time.Now()
 	todayLocal := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location())
 
 	rows := []models.TrafficHourlySummary{
 		{
-			HourTime: todayLocal.Add(time.Hour).UTC(), EndpointID: 1, InstanceID: "a",
+			HourTime: todayLocal.Add(-time.Hour).UTC(), EndpointID: 1, InstanceID: "a",
+			TCPRxIncrement: 1_000_000,
+		},
+		{
+			HourTime: todayLocal.UTC(), EndpointID: 1, InstanceID: "a",
 			TCPRxIncrement: 100, TCPTxIncrement: 200, UDPRxIncrement: 300, UDPTxIncrement: 400,
 		},
 		{

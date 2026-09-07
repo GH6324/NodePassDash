@@ -70,7 +70,7 @@ func (s *TrafficScheduler) Start() {
 			log.Printf("[流量调度器] 初始化24小时汇总数据完成，耗时: %v", duration)
 		}
 
-		// 然后执行上一小时的常规聚合（如果有遗漏）
+		// Refresh the current hour after the historical baselines are ready.
 		log.Println("[流量调度器] 执行启动时常规数据聚合...")
 		for attempt := 1; attempt <= 5; attempt++ {
 			err = s.trafficService.AggregateTrafficData()
@@ -85,10 +85,10 @@ func (s *TrafficScheduler) Start() {
 		} else {
 			log.Println("[流量调度器] 启动时常规数据聚合完成")
 		}
-	}()
 
-	// 启动定时任务
-	go s.runAligned()
+		// Serialize initialization and refreshes to avoid competing upserts.
+		s.runAligned()
+	}()
 
 	// 启动数据清理任务（每天凌晨3:15执行）
 	go s.runCleanupTask()
@@ -107,11 +107,11 @@ func (s *TrafficScheduler) Stop() {
 	log.Println("[流量调度器] 定时任务已停止")
 }
 
-// runAligned 在每个整点执行上一完整小时的聚合。
-// 整点后两分钟再校准一次，纳入可能延迟落库的最后一分钟数据。
+// runAligned refreshes minute snapshots without waiting for the hour to end.
+// Each run also reconciles the previous hour's delayed writes.
 func (s *TrafficScheduler) runAligned() {
 	now := time.Now()
-	nextRun := now.Truncate(time.Hour).Add(1 * time.Hour)
+	nextRun := now.Truncate(time.Minute).Add(time.Minute)
 	timer := time.NewTimer(time.Until(nextRun))
 	defer timer.Stop()
 
@@ -121,27 +121,11 @@ func (s *TrafficScheduler) runAligned() {
 			return
 		case <-timer.C:
 			s.executeAggregation()
-			s.scheduleReconciliation()
 
-			nextRun = nextRun.Add(1 * time.Hour)
+			nextRun = time.Now().Truncate(time.Minute).Add(time.Minute)
 			timer.Reset(time.Until(nextRun))
 		}
 	}
-}
-
-func (s *TrafficScheduler) scheduleReconciliation() {
-	go func() {
-		timer := time.NewTimer(2 * time.Minute)
-		defer timer.Stop()
-
-		select {
-		case <-s.ctx.Done():
-			return
-		case <-timer.C:
-			log.Println("[流量调度器] 开始执行整点流量校准...")
-			s.executeAggregation()
-		}
-	}()
 }
 
 // executeAggregation 执行数据聚合

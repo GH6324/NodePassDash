@@ -296,7 +296,7 @@ func (hw *HistoryWorker) aggregateAndEnqueueWrite(dataPoints []MonitoringData) {
 	historyModel := &models.ServiceHistory{
 		EndpointID:  firstPoint.EndpointID,
 		InstanceID:  firstPoint.InstanceID,
-		RecordTime:  lastPoint.Timestamp.Truncate(time.Minute), // 使用事件时间按分钟取整，避免写入延迟导致的错位
+		RecordTime:  lastPoint.Timestamp.UTC().Truncate(time.Minute), // Keep SQLite timestamp comparisons in UTC.
 		RecordCount: len(dataPoints),
 		UpCount:     len(dataPoints), // 所有数据点都算在线
 	}

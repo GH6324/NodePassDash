@@ -315,7 +315,7 @@ func (s *Service) GetTodayTraffic() (TodayTrafficIncrement, error) {
 // GetTrafficTrend 获取流量趋势数据
 func (s *Service) GetTrafficTrend(hours int) ([]TrafficTrendItem, error) {
 	// 使用新的dashboard_traffic_summary表获取流量趋势数据
-	end := time.Now()
+	end := normalizeHourStart(time.Now()).Add(time.Hour)
 	start := end.Add(-time.Duration(hours) * time.Hour)
 
 	// 从dashboard_traffic_summary表获取数据

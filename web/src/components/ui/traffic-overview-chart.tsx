@@ -59,34 +59,6 @@ const formatTrafficValue = (bytes: number) => {
   };
 };
 
-// 根据数据选择最合适的统一单位
-const getBestUnit = (values: number[]) => {
-  if (values.length === 0) return { unit: "B", divisor: 1 };
-
-  const maxValue = Math.max(...values);
-  const units = ["B", "KB", "MB", "GB", "TB"];
-  const divisors = [
-    1,
-    1024,
-    1024 * 1024,
-    1024 * 1024 * 1024,
-    1024 * 1024 * 1024 * 1024,
-  ];
-
-  let unitIndex = 0;
-  let testValue = maxValue;
-
-  while (testValue >= 1024 && unitIndex < units.length - 1) {
-    testValue /= 1024;
-    unitIndex++;
-  }
-
-  return {
-    unit: units[unitIndex],
-    divisor: divisors[unitIndex],
-  };
-};
-
 // 横坐标时间格式化函数 - 参考speed-chart的实现
 const formatAxisTime = (timestamp: string): string => {
   const date = new Date(timestamp);
@@ -265,56 +237,6 @@ function TrafficOverviewChartComponent({
     return { value: value.toString(), unit: "" };
   };
 
-  // 获取最佳单位用于图表显示 - 优化内存使用
-  const chartUnit = React.useMemo(() => {
-    if (!data || data.length === 0) return "B";
-
-    // 直接计算最大值，避免创建大型数组
-    let maxValue = 0;
-
-    for (const item of data) {
-      maxValue = Math.max(
-        maxValue,
-        item.tcpIn,
-        item.tcpOut,
-        item.udpIn,
-        item.udpOut,
-      );
-    }
-
-    const { unit } = getBestUnit([maxValue]);
-
-    return unit;
-  }, [data]);
-
-  // 转换数据为图表格式 - 优化内存使用
-  const chartData = React.useMemo(() => {
-    if (!data || data.length === 0) return [];
-
-    // 使用更高效的方式计算最大值，避免创建大型中间数组
-    let maxValue = 0;
-
-    for (const item of data) {
-      const values = [item.tcpIn, item.tcpOut, item.udpIn, item.udpOut];
-      const localMax = Math.max(...values);
-
-      if (localMax > maxValue) {
-        maxValue = localMax;
-      }
-    }
-
-    const { divisor } = getBestUnit([maxValue]);
-
-    // 直接返回转换后的数据，避免多次数组操作
-    return data.map((item) => ({
-      time: item.time, // 保持原始时间戳用于格式化
-      tcpIn: Math.round((item.tcpIn / divisor) * 100) / 100, // 使用Math.round代替parseFloat
-      tcpOut: Math.round((item.tcpOut / divisor) * 100) / 100,
-      udpIn: Math.round((item.udpIn / divisor) * 100) / 100,
-      udpOut: Math.round((item.udpOut / divisor) * 100) / 100,
-    }));
-  }, [data, timeRange]);
-
   if (loading) {
     return (
       <Card className="h-full min-h-[400px] dark:border-default-100 border border-transparent">
@@ -419,7 +341,7 @@ function TrafficOverviewChartComponent({
           width="100%"
         >
           <AreaChart
-            data={chartData}
+            data={data}
             margin={{
               left: 0,
               right: 0,

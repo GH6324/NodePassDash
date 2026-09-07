@@ -36,15 +36,18 @@ func normalizeHourStart(t time.Time) time.Time {
 	return t.UTC().Truncate(time.Hour)
 }
 
-// AggregateTrafficData 聚合当前小时的流量数据
+// AggregateTrafficData refreshes the current hour and reconciles late history
+// from the previous hour before using it as the current hour's baseline.
 func (s *TrafficService) AggregateTrafficData() error {
-	// Only aggregate completed hours. All database boundaries are UTC.
-	lastHour := normalizeHourStart(time.Now()).Add(-time.Hour)
-	return s.AggregateTrafficDataForHour(lastHour)
+	hour := normalizeHourStart(time.Now())
+	if err := s.AggregateTrafficDataForHour(hour.Add(-time.Hour)); err != nil {
+		return err
+	}
+	return s.AggregateTrafficDataForHour(hour)
 }
 
 // AggregateTrafficDataForHour 为指定小时聚合流量数据
-// 从service_history表获取上一小时59分的累计值，并计算与上一小时的差值
+// Stores the latest cumulative counters and sums observed snapshot increments.
 func (s *TrafficService) AggregateTrafficDataForHour(hourStart time.Time) error {
 	hourStart = normalizeHourStart(hourStart)
 	// 小时窗口结束时间
@@ -157,10 +160,10 @@ func (s *TrafficService) AggregateTrafficDataForHour(hourStart time.Time) error 
 							AND t.instance_id = prev.instance_id
 					)
 					AND NOT EXISTS (
-						SELECT 1 FROM traffic_hourly_summary cur
-						WHERE cur.hour_time = ?
-							AND cur.endpoint_id = prev.endpoint_id
-							AND cur.instance_id = prev.instance_id
+						SELECT 1 FROM service_history sh
+						WHERE sh.record_time >= ? AND sh.record_time < ?
+							AND sh.endpoint_id = prev.endpoint_id
+							AND sh.instance_id = prev.instance_id
 					)
 				ON CONFLICT(hour_time, endpoint_id, instance_id) DO UPDATE SET
 					tcp_rx_total = excluded.tcp_rx_total,
@@ -173,7 +176,7 @@ func (s *TrafficService) AggregateTrafficDataForHour(hourStart time.Time) error 
 					udp_tx_increment = excluded.udp_tx_increment,
 					record_count = excluded.record_count,
 					updated_at = CURRENT_TIMESTAMP
-			`, hourStart, previousHour, hourStart).Error; err != nil {
+			`, hourStart, previousHour, hourStart, hourEnd).Error; err != nil {
 				return fmt.Errorf("carry-forward 数据失败: %v", err)
 			}
 		}
@@ -218,7 +221,7 @@ func (s *TrafficService) calculateIncrements(tx *gorm.DB, hourStart time.Time) e
 		previousByInstance[trafficKey{row.EndpointID, row.InstanceID}] = row
 	}
 
-	type firstSnapshot struct {
+	type snapshot struct {
 		EndpointID int64  `gorm:"column:endpoint_id"`
 		InstanceID string `gorm:"column:instance_id"`
 		TCPRx      int64  `gorm:"column:tcp_rx"`
@@ -226,7 +229,7 @@ func (s *TrafficService) calculateIncrements(tx *gorm.DB, hourStart time.Time) e
 		UDPRx      int64  `gorm:"column:udp_rx"`
 		UDPTx      int64  `gorm:"column:udp_tx"`
 	}
-	var firstSnapshots []firstSnapshot
+	var snapshots []snapshot
 	if err := tx.Raw(`
 		SELECT
 			sh.endpoint_id,
@@ -235,21 +238,17 @@ func (s *TrafficService) calculateIncrements(tx *gorm.DB, hourStart time.Time) e
 			sh.delta_tcp_out AS tcp_tx,
 			sh.delta_udp_in AS udp_rx,
 			sh.delta_udp_out AS udp_tx
-		FROM service_history sh
-		INNER JOIN (
-			SELECT endpoint_id, instance_id, MIN(record_time) AS min_record_time
+		FROM (
+			SELECT *, ROW_NUMBER() OVER (
+				PARTITION BY endpoint_id, instance_id, record_time ORDER BY id DESC
+			) AS row_num
 			FROM service_history
 			WHERE record_time >= ? AND record_time < ?
-			GROUP BY endpoint_id, instance_id
-		) first_record ON sh.endpoint_id = first_record.endpoint_id
-			AND sh.instance_id = first_record.instance_id
-			AND sh.record_time = first_record.min_record_time
-	`, hourStart, hourEnd).Scan(&firstSnapshots).Error; err != nil {
-		return fmt.Errorf("查询小时初始快照失败: %v", err)
-	}
-	firstByInstance := make(map[trafficKey]firstSnapshot)
-	for _, row := range firstSnapshots {
-		firstByInstance[trafficKey{row.EndpointID, row.InstanceID}] = row
+		) sh
+		WHERE sh.row_num = 1
+		ORDER BY sh.record_time, sh.id
+	`, hourStart, hourEnd).Scan(&snapshots).Error; err != nil {
+		return fmt.Errorf("查询小时流量快照失败: %v", err)
 	}
 
 	trafficDelta := func(current, baseline int64) int64 {
@@ -260,30 +259,35 @@ func (s *TrafficService) calculateIncrements(tx *gorm.DB, hourStart time.Time) e
 		return current
 	}
 
-	for _, current := range currentRows {
-		key := trafficKey{current.EndpointID, current.InstanceID}
-		baselineTCPRx := current.TCPRxTotal
-		baselineTCPTx := current.TCPTxTotal
-		baselineUDPRx := current.UDPRxTotal
-		baselineUDPTx := current.UDPTxTotal
-
-		if previous, ok := previousByInstance[key]; ok {
-			baselineTCPRx = previous.TCPRxTotal
-			baselineTCPTx = previous.TCPTxTotal
-			baselineUDPRx = previous.UDPRxTotal
-			baselineUDPTx = previous.UDPTxTotal
-		} else if first, ok := firstByInstance[key]; ok {
-			baselineTCPRx = first.TCPRx
-			baselineTCPTx = first.TCPTx
-			baselineUDPRx = first.UDPRx
-			baselineUDPTx = first.UDPTx
+	// Comparing only hour-end counters loses traffic on an intra-hour reset,
+	// even when the counter has already grown past the previous hour's value.
+	baselines := make(map[trafficKey][4]int64)
+	increments := make(map[trafficKey][4]int64)
+	for key, previous := range previousByInstance {
+		baselines[key] = [4]int64{previous.TCPRxTotal, previous.TCPTxTotal, previous.UDPRxTotal, previous.UDPTxTotal}
+	}
+	for _, row := range snapshots {
+		key := trafficKey{row.EndpointID, row.InstanceID}
+		values := [4]int64{row.TCPRx, row.TCPTx, row.UDPRx, row.UDPTx}
+		if baseline, ok := baselines[key]; ok {
+			increment := increments[key]
+			for i := range values {
+				increment[i] += trafficDelta(values[i], baseline[i])
+			}
+			increments[key] = increment
 		}
+		// A newly observed instance starts at its first snapshot, so traffic
+		// accumulated before monitoring began is not charged to this hour.
+		baselines[key] = values
+	}
 
+	for _, current := range currentRows {
+		increment := increments[trafficKey{current.EndpointID, current.InstanceID}]
 		updates := map[string]interface{}{
-			"tcp_rx_increment": trafficDelta(current.TCPRxTotal, baselineTCPRx),
-			"tcp_tx_increment": trafficDelta(current.TCPTxTotal, baselineTCPTx),
-			"udp_rx_increment": trafficDelta(current.UDPRxTotal, baselineUDPRx),
-			"udp_tx_increment": trafficDelta(current.UDPTxTotal, baselineUDPTx),
+			"tcp_rx_increment": increment[0],
+			"tcp_tx_increment": increment[1],
+			"udp_rx_increment": increment[2],
+			"udp_tx_increment": increment[3],
 		}
 		if err := tx.Model(&models.TrafficHourlySummary{}).
 			Where("id = ?", current.ID).
@@ -425,7 +429,7 @@ func (s *TrafficService) GetTrafficData(instanceID string, start, end time.Time)
 	var data []models.TrafficHourlySummary
 
 	err := s.db.Where("instance_id = ? AND hour_time >= ? AND hour_time < ?",
-		instanceID, start, end).
+		instanceID, start.UTC(), end.UTC()).
 		Order("hour_time ASC").
 		Find(&data).Error
 
@@ -440,7 +444,7 @@ func (s *TrafficService) GetTrafficData(instanceID string, start, end time.Time)
 func (s *TrafficService) GetDashboardTrafficData(start, end time.Time) ([]models.DashboardTrafficSummary, error) {
 	var data []models.DashboardTrafficSummary
 
-	err := s.db.Where("hour_time >= ? AND hour_time < ?", start, end).
+	err := s.db.Where("hour_time >= ? AND hour_time < ?", start.UTC(), end.UTC()).
 		Order("hour_time ASC").
 		Find(&data).Error
 
@@ -453,7 +457,7 @@ func (s *TrafficService) GetDashboardTrafficData(start, end time.Time) ([]models
 
 // GetTrafficTrendOptimized 获取优化后的流量趋势数据
 func (s *TrafficService) GetTrafficTrendOptimized(hours int) ([]TrafficTrendItem, error) {
-	end := time.Now()
+	end := normalizeHourStart(time.Now()).Add(time.Hour)
 	start := end.Add(-time.Duration(hours) * time.Hour)
 
 	// 获取所有隧道的汇总数据
@@ -468,7 +472,7 @@ func (s *TrafficService) GetTrafficTrendOptimized(hours int) ([]TrafficTrendItem
 	// 按小时汇总所有隧道的流量
 	hourlyTraffic := make(map[string]*TrafficTrendItem)
 	for _, summary := range summaries {
-		hourKey := summary.HourTime.Format("2006-01-02 15:00:00")
+		hourKey := summary.HourTime.UTC().Format("2006-01-02 15:00:00")
 		if _, exists := hourlyTraffic[hourKey]; !exists {
 			hourlyTraffic[hourKey] = &TrafficTrendItem{
 				HourTime:    summary.HourTime.Unix(),
